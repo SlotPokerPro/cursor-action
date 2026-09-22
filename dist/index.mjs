@@ -1,5 +1,6 @@
 import { endGroup, getInput, info, setFailed, setOutput, setSecret, startGroup, summary, warning } from "@actions/core";
 import path from "node:path";
+import { setTimeout as setTimeout$1 } from "node:timers/promises";
 import { Agent } from "@cursor/sdk";
 //#region src/input.ts
 const VALID_PERMISSIONS = [
@@ -104,6 +105,8 @@ const setOutputs = async (result) => {
 const maskSecret = (apiKey) => setSecret(apiKey);
 //#endregion
 //#region src/runner.ts
+const FORCE_STOP_GRACE_MS = 15e3;
+const DISPOSE_TIMEOUT_MS = 5e3;
 const extractErrorMessage = (error) => {
 	if (error instanceof Error) return error.cause ? `${error.message}\nCause: ${error.cause}` : error.message;
 	return String(error);
@@ -119,6 +122,61 @@ const mapUsage = (usage) => {
 		totalTokens
 	};
 };
+const disposeAgent = async (agent) => {
+	const dispose = agent[Symbol.asyncDispose];
+	if (typeof dispose !== "function") return;
+	await Promise.race([Promise.resolve(dispose.call(agent)).catch((error) => {
+		warning(`Failed to dispose Cursor agent: ${extractErrorMessage(error)}`);
+	}), setTimeout$1(DISPOSE_TIMEOUT_MS)]);
+};
+const clearTimer = (timer) => {
+	if (timer !== void 0) clearTimeout(timer);
+};
+const appendError = (stderr, message) => {
+	warning(message);
+	return stderr ? `${stderr}\n${message}` : message;
+};
+const collectRun = async (run, wasTimedOut, timeoutSeconds) => {
+	let stdout = "";
+	for await (const event of run.stream()) if ("text" in event && typeof event.text === "string") stdout += event.text;
+	const runResult = await run.wait();
+	if (runResult.result && typeof runResult.result === "string") stdout = runResult.result;
+	let stderr = "";
+	let exitCode = 0;
+	if (runResult.status === "error") {
+		exitCode = 1;
+		stderr = appendError(stderr, runResult.error?.message ?? "Agent run failed with error.");
+	} else if (runResult.status === "cancelled") {
+		exitCode = 1;
+		stderr = appendError(stderr, wasTimedOut() ? `Agent run timed out after ${timeoutSeconds}s and was cancelled.` : "Agent run was cancelled.");
+	}
+	return {
+		durationMs: runResult.durationMs,
+		exitCode,
+		status: runResult.status,
+		stderr,
+		stdout,
+		usage: mapUsage(runResult.usage)
+	};
+};
+const scheduleTimeout = (run, timeoutMs, timeoutSeconds, onTimeout) => {
+	let forceStopTimer;
+	return {
+		cancelTimer: setTimeout(() => {
+			onTimeout();
+			(async () => {
+				if (run.supports("cancel")) try {
+					await run.cancel();
+				} catch {}
+			})();
+			forceStopTimer = setTimeout(() => {
+				warning(`Agent run timed out after ${timeoutSeconds}s and did not stop. Exiting.`);
+				process.exit(1);
+			}, FORCE_STOP_GRACE_MS);
+		}, timeoutMs),
+		getForceStopTimer: () => forceStopTimer
+	};
+};
 const runAgent = async (inputs) => {
 	const cwd = path.resolve(inputs.workingDirectory);
 	info(`Running Cursor Agent in: ${cwd}`);
@@ -130,49 +188,36 @@ const runAgent = async (inputs) => {
 	let status = "finished";
 	let durationMs;
 	let usage;
+	let agent;
+	let cancelTimer;
+	let getForceStopTimer;
 	try {
-		const run = await (await Agent.create({
+		agent = await Agent.create({
 			apiKey: inputs.apiKey,
 			local: { cwd },
 			model: { id: inputs.model }
-		})).send(inputs.prompt);
+		});
+		const run = await agent.send(inputs.prompt);
 		const timeoutMs = inputs.timeout * 1e3;
-		let cancelTimer;
 		let timedOut = false;
-		if (timeoutMs > 0 && Number.isFinite(timeoutMs)) cancelTimer = setTimeout(() => {
+		if (timeoutMs > 0 && Number.isFinite(timeoutMs)) ({cancelTimer, getForceStopTimer} = scheduleTimeout(run, timeoutMs, inputs.timeout, () => {
 			timedOut = true;
-			(async () => {
-				if (run.supports("cancel")) try {
-					await run.cancel();
-				} catch {}
-			})();
-		}, timeoutMs);
+		}));
 		try {
-			for await (const event of run.stream()) if ("text" in event && typeof event.text === "string") stdout += event.text;
-			const runResult = await run.wait();
-			({durationMs} = runResult);
-			usage = mapUsage(runResult.usage);
-			if (runResult.result && typeof runResult.result === "string") stdout = runResult.result;
-			({status} = runResult);
-			if (status === "error") {
-				exitCode = 1;
-				const msg = runResult.error?.message ?? "Agent run failed with error.";
-				stderr += stderr ? `\n${msg}` : msg;
-				warning(`Agent execution failed: ${msg}`);
-			} else if (status === "cancelled") {
-				exitCode = 1;
-				const msg = timedOut ? `Agent run timed out after ${inputs.timeout}s and was cancelled.` : "Agent run was cancelled.";
-				stderr += stderr ? `\n${msg}` : msg;
-				warning(msg);
-			}
+			const collected = await collectRun(run, () => timedOut, inputs.timeout);
+			({durationMs, exitCode, status, stderr, stdout, usage} = collected);
 		} finally {
-			if (cancelTimer !== void 0) clearTimeout(cancelTimer);
+			clearTimer(cancelTimer);
+			clearTimer(getForceStopTimer?.());
 		}
 	} catch (error) {
 		exitCode = 1;
 		status = "error";
-		stderr += extractErrorMessage(error);
-		warning(`Agent execution failed: ${stderr}`);
+		stderr = appendError(stderr, extractErrorMessage(error));
+	} finally {
+		clearTimer(cancelTimer);
+		clearTimer(getForceStopTimer?.());
+		if (agent !== void 0) await disposeAgent(agent);
 	}
 	return {
 		diagnostics: exitCode === 0 ? void 0 : stderr,
@@ -186,7 +231,15 @@ const runAgent = async (inputs) => {
 };
 //#endregion
 //#region src/index.ts
+const exitAfterFlush = (code) => {
+	const kill = setTimeout(() => process.exit(code), 1e3);
+	process.stdout.write("", () => {
+		clearTimeout(kill);
+		process.exit(code);
+	});
+};
 const run = async () => {
+	let code = 0;
 	try {
 		const inputs = getInputs();
 		maskSecret(inputs.apiKey);
@@ -194,10 +247,16 @@ const run = async () => {
 		const result = await runAgent(inputs);
 		endGroup();
 		const outputs = await setOutputs(result);
-		if (outputs.exitCode !== 0) setFailed(`cursor-agent exited with code ${outputs.exitCode}. See the job summary for details.`);
+		if (outputs.exitCode !== 0) {
+			code = outputs.exitCode;
+			setFailed(`cursor-agent exited with code ${outputs.exitCode}. See the job summary for details.`);
+		}
 	} catch (error) {
+		code = 1;
 		if (error instanceof Error) setFailed(error.message);
 		else setFailed(String(error));
+	} finally {
+		exitAfterFlush(code);
 	}
 };
 run();

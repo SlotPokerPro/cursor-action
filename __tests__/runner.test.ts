@@ -15,6 +15,7 @@ mock.module("@actions/core", () => ({
 const mockAgentCreate = mock();
 const mockAgentSend = mock();
 const mockRunCancel = mock(() => Promise.resolve());
+const mockDispose = mock(() => Promise.resolve());
 
 mock.module("@cursor/sdk", () => ({
   Agent: {
@@ -74,6 +75,7 @@ describe("runAgent", () => {
 
     mockAgentCreate.mockResolvedValue({
       send: mockAgentSend,
+      [Symbol.asyncDispose]: mockDispose,
     });
 
     mockAgentSend.mockResolvedValue({
@@ -95,6 +97,7 @@ describe("runAgent", () => {
 
     expect(mockAgentSend).toHaveBeenCalledWith("Analyze this code");
     expect(mockRunCancel).not.toHaveBeenCalled();
+    expect(mockDispose).toHaveBeenCalled();
     expect(result.exitCode).toBe(0);
     expect(result.status).toBe("finished");
     expect(result.stdout).toBe("Hello from stream chunk 1. And chunk 2.");
