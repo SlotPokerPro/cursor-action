@@ -60,6 +60,21 @@ describe("setOutputs", () => {
     expect(outputs.summary).toBe("JSON response text");
   });
 
+  it("keeps JSON findings so callers can comment on lines", async () => {
+    const stdout = JSON.stringify({
+      findings: [
+        { body: "nil deref", line: 3, path: "a.go", severity: "high" },
+      ],
+      summary: "One bug",
+    });
+    const outputs = await setOutputs({
+      exitCode: 0,
+      stderr: "",
+      stdout,
+    });
+    expect(outputs.summary).toBe(stdout);
+  });
+
   it("extracts summary from JSON summary field", async () => {
     const result = {
       exitCode: 0,

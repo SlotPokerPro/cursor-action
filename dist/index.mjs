@@ -35,6 +35,15 @@ const getInputs = () => {
 };
 //#endregion
 //#region src/output.ts
+const structuredAgentResponse = (stdout) => {
+	const trimmed = stdout.trim();
+	const fenced = trimmed.match(/```(?:json)?\s*(?<body>[\s\S]*?)```/u);
+	const candidates = fenced?.groups?.body ? [fenced.groups.body.trim(), trimmed] : [trimmed];
+	for (const candidate of candidates) try {
+		const parsed = JSON.parse(candidate);
+		if (parsed && typeof parsed === "object" && !Array.isArray(parsed) && Array.isArray(parsed.findings)) return candidate;
+	} catch {}
+};
 const parseSummary = (stdout) => {
 	const trimmed = stdout.trim();
 	if (!trimmed) return "";
@@ -84,7 +93,7 @@ const setMetricOutputs = (result) => {
 	if (usage?.outputTokens !== void 0) setOutput("output-tokens", String(usage.outputTokens));
 };
 const setOutputs = async (result) => {
-	const text = parseSummary(result.stdout);
+	const text = structuredAgentResponse(result.stdout) ?? parseSummary(result.stdout);
 	const status = result.status ?? (result.exitCode === 0 ? "finished" : "error");
 	setOutput("summary", text);
 	setOutput("exit-code", String(result.exitCode));

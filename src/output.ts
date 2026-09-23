@@ -2,6 +2,31 @@ import { setOutput, setSecret, summary } from "@actions/core";
 
 import type { ActionOutputs, AgentResult } from "./types";
 
+const structuredAgentResponse = (stdout: string): string | undefined => {
+  const trimmed = stdout.trim();
+  const fenced = trimmed.match(/```(?:json)?\s*(?<body>[\s\S]*?)```/u);
+  const candidates = fenced?.groups?.body
+    ? [fenced.groups.body.trim(), trimmed]
+    : [trimmed];
+
+  for (const candidate of candidates) {
+    try {
+      const parsed = JSON.parse(candidate);
+      if (
+        parsed &&
+        typeof parsed === "object" &&
+        !Array.isArray(parsed) &&
+        Array.isArray(parsed.findings)
+      ) {
+        return candidate;
+      }
+    } catch {
+      // Not the structured review payload.
+    }
+  }
+  return undefined;
+};
+
 const parseSummary = (stdout: string): string => {
   const trimmed = stdout.trim();
   if (!trimmed) {
@@ -137,7 +162,8 @@ const setMetricOutputs = (result: AgentResult): void => {
 export const setOutputs = async (
   result: AgentResult
 ): Promise<ActionOutputs> => {
-  const text = parseSummary(result.stdout);
+  const text =
+    structuredAgentResponse(result.stdout) ?? parseSummary(result.stdout);
   const status =
     result.status ?? (result.exitCode === 0 ? "finished" : "error");
 
